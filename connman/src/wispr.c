@@ -30,6 +30,8 @@
 
 #include "connman.h"
 
+#define WISPR_DEFAULT_POLL_DELAY 1
+
 struct connman_wispr_message {
 	gboolean has_error;
 	const char *current_element;
@@ -38,9 +40,11 @@ struct connman_wispr_message {
 	char *login_url;
 	char *abort_login_url;
 	char *logoff_url;
+	char *login_results_url;
 	char *access_procedure;
 	char *access_location;
 	char *location_name;
+	int delay;
 };
 
 enum connman_wispr_result {
@@ -48,6 +52,7 @@ enum connman_wispr_result {
 	CONNMAN_WISPR_RESULT_LOGIN   = 1,
 	CONNMAN_WISPR_RESULT_ONLINE  = 2,
 	CONNMAN_WISPR_RESULT_FAILED  = 3,
+	CONNMAN_WISPR_RESULT_PENDING = 4,
 };
 
 struct wispr_route {
@@ -76,6 +81,9 @@ struct connman_wispr_portal_context {
 	char *wispr_username;
 	char *wispr_password;
 	char *wispr_formdata;
+
+	int wispr_delay;
+	char *wispr_login_results_url;
 
 	enum connman_wispr_result wispr_result;
 
@@ -112,6 +120,9 @@ static void connman_wispr_message_init(struct connman_wispr_message *msg)
 	g_free(msg->logoff_url);
 	msg->logoff_url = NULL;
 
+	g_free(msg->login_results_url);
+	msg->login_results_url = NULL;
+
 	g_free(msg->access_procedure);
 	msg->access_procedure = NULL;
 
@@ -120,6 +131,8 @@ static void connman_wispr_message_init(struct connman_wispr_message *msg)
 
 	g_free(msg->location_name);
 	msg->location_name = NULL;
+
+	msg->delay = WISPR_DEFAULT_POLL_DELAY;
 }
 
 static void free_wispr_routes(struct connman_wispr_portal_context *wp_context)
@@ -360,9 +373,16 @@ static void xml_wispr_text_handler(GMarkupParseContext *context,
 			msg->response_code = atoi(text);
 			break;
 		case WISPR_ELEMENT_NEXT_URL:
-		case WISPR_ELEMENT_DELAY:
 		case WISPR_ELEMENT_REPLY_MESSAGE:
+			break;
+		case WISPR_ELEMENT_DELAY:
+			msg->delay = atoi(text);
+			if (msg->delay <= 0)
+				msg->delay = WISPR_DEFAULT_POLL_DELAY;
+			break;
 		case WISPR_ELEMENT_LOGIN_RESULTS_URL:
+			g_free(msg->login_results_url);
+			msg->login_results_url = g_strdup(text);
 			break;
 		case WISPR_ELEMENT_LOGOFF_URL:
 			g_free(msg->logoff_url);
@@ -605,6 +625,23 @@ static void wispr_portal_request_wispr_login(struct connman_service *service,
 	connman_wispr_message_init(&wp_context->wispr_msg);
 }
 
+static gboolean auth_delay_callback(gpointer user_data)
+{
+	struct connman_wispr_portal_context *wp_context = user_data;
+
+	DBG("");
+
+	wp_context->timeout = 0;
+
+	wp_context->request_id = g_web_request_get(wp_context->web,
+					wp_context->wispr_login_results_url,
+					wispr_portal_web_result,
+					wispr_route_request,
+					wp_context);
+
+	return FALSE;
+}
+
 static gboolean wispr_manage_message(GWebResult *result,
 			struct connman_wispr_portal_context *wp_context)
 {
@@ -631,6 +668,11 @@ static gboolean wispr_manage_message(GWebResult *result,
 			wp_context->wispr_msg.abort_login_url);
 	if (wp_context->wispr_msg.logoff_url != NULL)
 		DBG("Logoff URL: %s", wp_context->wispr_msg.logoff_url);
+	if (wp_context->wispr_msg.delay != 0)
+		DBG("Delay: %d", wp_context->wispr_msg.delay);
+	if (wp_context->wispr_msg.login_results_url != NULL)
+		DBG("Login Results URL: %s",
+			wp_context->wispr_msg.login_results_url);
 
 	switch (wp_context->wispr_msg.message_type) {
 	case 100:
@@ -663,6 +705,29 @@ static gboolean wispr_manage_message(GWebResult *result,
 			wispr_portal_request_portal(wp_context);
 
 			return TRUE;
+
+		} else if (wp_context->wispr_msg.response_code == 201) {
+			DBG("Authentication pending");
+
+			wp_context->wispr_result = CONNMAN_WISPR_RESULT_PENDING;
+
+			wp_context->wispr_delay =
+				wp_context->wispr_msg.delay;
+
+			g_free(wp_context->wispr_login_results_url);
+			wp_context->wispr_login_results_url = g_strdup
+				(wp_context->wispr_msg.login_results_url);
+
+			if (wp_context->timeout > 0)
+				g_source_remove(wp_context->timeout);
+
+			wp_context->timeout =
+				g_timeout_add_seconds(wp_context->wispr_delay,
+						auth_delay_callback,
+						wp_context);
+
+			return TRUE;
+
 		} else
 			wispr_portal_error(wp_context);
 
@@ -689,11 +754,13 @@ static gboolean wispr_portal_web_result(GWebResult *result, gpointer user_data)
 		g_web_result_get_chunk(result, &chunk, &length);
 
 		if (length > 0) {
+			DBG("chunk: %.*s", length, chunk);
 			g_web_parser_feed_data(wp_context->wispr_parser,
 								chunk, length);
 			return TRUE;
 		}
 
+		DBG("end of data.");
 		g_web_parser_end_data(wp_context->wispr_parser);
 
 		if (wp_context->wispr_msg.message_type >= 0) {
@@ -705,6 +772,7 @@ static gboolean wispr_portal_web_result(GWebResult *result, gpointer user_data)
 	status = g_web_result_get_status(result);
 
 	DBG("status: %03u", status);
+	DBG("message type: %d", wp_context->wispr_msg.message_type);
 
 	switch (status) {
 	case 200:
